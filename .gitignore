@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+
+# Models (downloaded weights)
+models/
+
+# Data (downloaded datasets)
+data/datasets/sft-reason/
+
+# Outputs
+outputs/
+logs/
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Ruff
+.ruff_cache/
+
+# Submission
+*.zip
+
+# Wandb
+wandb/
