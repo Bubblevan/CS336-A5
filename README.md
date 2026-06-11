@@ -57,6 +57,10 @@ cs336-linux/
 
 ```bash
 # 使用 uv 管理依赖
+apt update && apt install curl -y
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+
 uv sync --no-install-package flash-attn
 uv sync
 
@@ -65,8 +69,33 @@ uv run pytest
 ```
 
 ## 数据准备
-
+```bash
+./hfd.sh Qwen/Qwen2.5-Math-1.5B \
+  --local-dir models/Qwen2.5-Math-1.5B \
+  -x 8 -j 6
+```
 将作业 handout 提供的数据放到 `data/datasets/sft-reason/`、`data/MATH/` 等目录下。
+```bash
+./hfd.sh openai/gsm8k \
+  --dataset \
+  --local-dir data/gsm8k
+
+./hfd.sh cais/mmlu \
+  --dataset \
+  --local-dir data/mmlu_hf
+
+./hfd.sh Anthropic/hh-rlhf \
+  --dataset \
+  --local-dir data/hh
+
+./hfd.sh tatsu-lab/alpaca_eval \
+  --dataset \
+  --local-dir data/alpaca_eval_hf
+
+./hfd.sh Bertievidgen/SimpleSafetyTests \
+  --dataset \
+  --local-dir data/simple_safety_tests
+```
 
 ## 训练流程
 
