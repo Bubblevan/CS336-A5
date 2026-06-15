@@ -10,7 +10,7 @@
 ## 项目结构
 
 ```
-cs336-linux/
+cs336-a5/
 ├── cs336_alignment/           # 主包
 │   ├── __init__.py
 │   ├── SFT_util/              # SFT 工具函数
@@ -36,12 +36,12 @@ cs336-linux/
 │   ├── run_grpo.py            # GRPO/Expert Iteration 训练主脚本
 │   ├── drgrpo_grader.py       # MATH 打分函数（格式 + 答案判分）
 │   └── plot_sft_curves.py     # 训练曲线可视化
-├── data/                      # 数据集（需从远程服务器下载或挂载）
-│   ├── datasets/
-│   │   └── sft-reason/        # SFT 推理数据
-│   ├── MATH/                  # MATH 验证集
-│   ├── MMLU/                  # MMLU 基准
-│   └── GSM8K/                 # GSM8K 基准
+├── data/                      # 数据集
+│   ├── alpaca_eval_hf/        # AlpacaEval 评估基准
+│   ├── gsm8k/                 # GSM8K 数学推理基准
+│   ├── hh/                    # Anthropic HH-RLHF 偏好数据
+│   ├── mmlu_hf/               # MMLU 多任务语言理解基准
+│   └── simple_safety_tests/   # 简单安全测试集
 ├── models/                    # 预训练模型权重（gitignored）
 ├── outputs/                   # 训练输出（checkpoints、日志）
 ├── logs/                      # 运行日志
@@ -53,7 +53,7 @@ cs336-linux/
 └── README.md
 ```
 
-## 环境搭建（在远程 Linux 服务器上）
+## 环境搭建
 
 ```bash
 # 使用 uv 管理依赖
@@ -74,7 +74,7 @@ uv run pytest
   --local-dir models/Qwen2.5-Math-1.5B \
   -x 8 -j 6
 ```
-将作业 handout 提供的数据放到 `data/datasets/sft-reason/`、`data/MATH/` 等目录下。
+将作业 handout 提供的数据放到目录下。
 ```bash
 ./hfd.sh openai/gsm8k \
   --dataset \

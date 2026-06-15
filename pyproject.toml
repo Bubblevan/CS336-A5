@@ -14,6 +14,8 @@ dependencies = [
     "einops",
     "pytest",
     "matplotlib",
+    "datasets>3.0.0",
+    "ms-swift>=3.0.0",
 ]
 
 [build-system]
