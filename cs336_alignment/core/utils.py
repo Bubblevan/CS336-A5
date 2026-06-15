@@ -1,16 +1,12 @@
 """Shared infrastructure utilities.
 
-V0 目标：
-- 稳定加载 HuggingFace causal LM + tokenizer；
-- 设置随机种子；
-- 提供最小 JSON / JSONL 工具函数。
-
-后续再慢慢扩展：
-- checkpoint resume
-- run name
-- wandb
-- distributed training
+V1 更新：
+- 更稳的 HuggingFace model/tokenizer loader；
+- 支持 flash_attention_2；
+- decoder-only generation 默认 left padding；
+- 保留 JSON / JSONL 工具函数。
 """
+
 from __future__ import annotations
 
 import json
@@ -22,48 +18,92 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def _get_attn_implementation(device: torch.device) -> str:
-    """Pick attention backend: flash_attention_2 if available, else eager."""
-    if device.type == "cpu":
-        return "eager"
-    try:
-        import flash_attn  # noqa: F401
-        return "flash_attention_2"
-    except ImportError:
-        print("Warning: flash-attn not installed, falling back to eager attention.")
-        return "eager"
 
 def set_seed(seed: int) -> None:
-    """Set random seed for reproducibility."""
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def resolve_torch_dtype(dtype: str | torch.dtype | None) -> torch.dtype:
+    """Convert dtype string to torch dtype."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    if dtype is None or dtype == "auto":
+        return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    normalized = dtype.lower()
+
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
 def get_model_and_tokenizer(
     model_id_or_dir: str,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str = "cuda:0",
     *,
-    dtype: torch.dtype | None=None,
+    dtype: str | torch.dtype | None = "bfloat16",
+    attn_implementation: str | None = "flash_attention_2",
+    trust_remote_code: bool = True,
 ):
-    """Load a HuggingFace model and tokenizer from a local path or hub id."""
-    device_obj = torch.device(device)
+    """Load a HuggingFace causal LM and tokenizer.
 
-    if dtype is None:
-        dtype = torch.bfloat16 if device_obj.type == "cuda" else torch.float32
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir, trust_remote_code=True)
-    # 一般来说 Decoder-only 模型的 tokenizer 都没有 pad token，所以我们需要手动设置一下。
-    # 对于 Generation/eval，一般都重用 EOS token 作为 PAD token 就好了。
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+    Args:
+        model_id_or_dir:
+            HuggingFace model id or local checkpoint path.
+        device:
+            "cuda:0", "cuda:1", or "cpu".
+        dtype:
+            "bfloat16", "float16", "float32", "auto", or torch.dtype.
+        attn_implementation:
+            For CUDA, usually "flash_attention_2" if installed.
+            Use "eager" or None if debugging compatibility issues.
+        trust_remote_code:
+            Passed to HuggingFace loaders.
+
+    Returns:
+        model, tokenizer
+    """
+    device_obj = torch.device(device)
+    torch_dtype = resolve_torch_dtype(dtype)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id_or_dir,
+        trust_remote_code=trust_remote_code,
+    )
+
+    # Decoder-only generation 通常建议 left padding。
+    tokenizer.padding_side = "left"
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": trust_remote_code,
+    }
+
+    if attn_implementation is not None:
+        # CPU 上 flash attention 不可用，自动降级。
+        if device_obj.type == "cpu" and attn_implementation == "flash_attention_2":
+            model_kwargs["attn_implementation"] = "eager"
+        else:
+            model_kwargs["attn_implementation"] = attn_implementation
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_dir,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation=_get_attn_implementation(device_obj),
+        **model_kwargs,
     )
 
     model.to(device_obj)
@@ -71,71 +111,67 @@ def get_model_and_tokenizer(
 
     return model, tokenizer
 
-# --- JSON / JSONL utils ---
+
 def json_safe(obj: Any) -> Any:
-    """Convert an object to a JSON-serializable format."""
-    # 对于 Path 对象，我们希望它能被转换成一个普通的字符串路径，这样就可以直接被 JSON 序列化了。
+    """Convert common Python / torch / numpy objects to JSON-safe values."""
     if isinstance(obj, Path):
         return str(obj)
-    # 对于 Tensor，我们希望它能被转换成一个普通的 Python 数字或者列表，这样就可以直接被 JSON 序列化了。
+
     if isinstance(obj, torch.Tensor):
-        if obj.numel()==1:
+        if obj.numel() == 1:
             return obj.detach().cpu().item()
         return obj.detach().cpu().tolist()
 
     if isinstance(obj, np.ndarray):
-        if obj.size == 1:
-            return obj.item()
         return obj.tolist()
 
     if isinstance(obj, np.generic):
         return obj.item()
 
-    if isinstance(obj, list):
-        return [json_safe(x) for x in obj]
-
     if isinstance(obj, dict):
         return {str(k): json_safe(v) for k, v in obj.items()}
 
+    if isinstance(obj, list):
+        return [json_safe(x) for x in obj]
+
     if isinstance(obj, tuple):
-        return tuple(json_safe(x) for x in obj)
+        return [json_safe(x) for x in obj]
 
     return obj
 
-def append_jsonl(path: str |Path, obj: dict[str, Any]) -> None:
-    """Append an object to a JSONL file."""
+
+def append_jsonl(path: str | Path, obj: dict[str, Any]) -> None:
+    """Append one JSON object to a JSONL file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("a", encoding="utf-8") as f:
-        json.dump(json_safe(obj), f, ensure_ascii=False)
-        f.write("\n")
+        f.write(json.dumps(json_safe(obj), ensure_ascii=False) + "\n")
+
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     """Load a JSONL file into a list of dicts."""
     path = Path(path)
-    rows: list[dict[str, Any]] = [] # 先声明一个空列表，避免后续 mypy 报错 "Incompatible types in assignment (expression has type "list[dict[str, Any]]", variable has type "list[dict[str, Any]]")"
-    if not path.exists():
-        return []
+    rows: list[dict[str, Any]] = []
 
     with path.open("r", encoding="utf-8") as f:
         for line_idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            try:
-                obj = json.loads(line)
-                rows.append(obj)
-            except json.JSONDecodeError as e:
-                print(f"Warning: Skipping invalid JSON on line {line_idx} of {path}: {e}")
-                continue
-        return rows
 
-def write_json(path: str | Path, obj: dict[str, Any]) -> None:
-    """Write an object to a JSON file."""
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON at {path}:{line_idx}") from e
+
+    return rows
+
+
+def write_json(path: str | Path, obj: Any) -> None:
+    """Write one JSON file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as f:
         json.dump(json_safe(obj), f, ensure_ascii=False, indent=2)
-

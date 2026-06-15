@@ -113,8 +113,6 @@ source .venv/bin/activate
   -x 8 -j 6
 ```
 
-> 如果从 HuggingFace 拉取失败，确认已配置 `huggingface-cli login` 或使用镜像站。
-
 ### GSM8K
 
 - **来源**: [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) — OpenAI 发布的 8,500 道小学数学应用题，每道需 2-8 步推理。
@@ -236,15 +234,40 @@ uv run python -m cs336_alignment.run_grpo \
 
 ### GSM8K（数学推理）
 
-使用 `run_benchmarks.py` 对模型进行 GSM8K 测试集评估：
+使用 `run_benchmarks.py` 对模型进行 GSM8K 测试集评估。支持两种推理后端：`vllm`（默认，推荐）和 `hf`（fallback）。
+
+#### vLLM 后端
+
+```bash
+# 安装编译依赖（仅首次需要）
+apt-get update && apt-get install -y build-essential python3-dev cuda-cudart-dev-12-0
+
+CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  uv run python -m cs336_alignment.run_benchmarks \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B \
+    --engine vllm \
+    --benchmarks gsm8k \
+    --gsm8k_path data/gsm8k/main/test-00000-of-00001.parquet \
+    --output_dir outputs/baseline_qwen_math_vllm \
+    --max_new_tokens 512 \
+    --gpu_memory_utilization 0.90 \
+    --max_model_len 2048
+```
+
+> `VLLM_WORKER_MULTIPROC_METHOD=spawn` 是 vLLM V1 引擎在 Linux 下的必要条件——Python 默认 `fork` 会复制父进程 CUDA 上下文，导致子进程 `RuntimeError: Cannot re-initialize CUDA in forked subprocess`。
+
+#### HuggingFace 后端（无 vLLM 时 fallback）
 
 ```bash
 uv run python -m cs336_alignment.run_benchmarks \
     --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B \
+    --engine hf \
     --benchmarks gsm8k \
     --gsm8k_path data/gsm8k/main \
-    --output_dir outputs/baseline_qwen_math \
+    --output_dir outputs/baseline_qwen_math_hf \
     --device cuda:0 \
+    --hf_batch_size 8 \
+    --attn_implementation eager \
     --max_new_tokens 512
 ```
 

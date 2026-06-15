@@ -1,37 +1,45 @@
 """GSM8K baseline evaluation.
 
-V0 功能：
-- 读取 GSM8K parquet / jsonl；
-- 对每道题 greedy generate；
-- 从模型输出中解析最终数字；
-- 与 gold answer 比较；
-- 输出 summary dict；
-- 可选保存逐题 predictions.jsonl。
+V1 更新：
+- 生成逻辑从 eval/gsm8k.py 中拆出；
+- 支持 HFGenerator / VLLMGenerator；
+- 一次构造所有 prompts，然后批量生成；
+- 输出 summary + predictions.jsonl；
+- 记录 eval wall time 和 examples/sec。
 
 暂时不做：
-- batched generation
 - few-shot prompting
-- vLLM
-- distributed eval
-- majority vote / self-consistency
+- self-consistency
+- pass@k / majority vote
+- answer-level normalization beyond numeric matching
 """
+
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
-import torch
 from tqdm import tqdm
 
 from cs336_alignment.core.utils import append_jsonl, load_jsonl
-from cs336_alignment.eval.parsers import parse_gsm8k_response, parse_gsm8k_gold_answer, numbers_equal
+from cs336_alignment.eval.generation import TextGenerator
+from cs336_alignment.eval.parsers import (
+    numbers_equal,
+    parse_gsm8k_gold_answer,
+    parse_gsm8k_response,
+)
+
 
 def make_gsm8k_prompt(question: str) -> str:
     """Build a simple zero-shot GSM8K prompt.
 
-    这个 prompt 故意简单：
-    baseline 阶段先看 base model 的零样本能力。
-    后面可以再加 few-shot / chat template。
+    这个 prompt 保持和上一版一致，保证 baseline 可比。
+    后续可以新增 --prompt_style 来比较：
+    - zero_shot
+    - few_shot
+    - qwen_math_style
+    - socratic
     """
     return (
         "Solve the following grade school math problem. "
@@ -41,19 +49,30 @@ def make_gsm8k_prompt(question: str) -> str:
         "Solution:\n"
     )
 
+
 def _read_parquet(path: Path) -> list[dict[str, Any]]:
-    # 不知道传闻是不是真的
-    # datasets里有pyarrow吗
-    import pyarrow.parquet as pq
+    """Read parquet using pyarrow."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as e:
+        raise ImportError(
+            "Reading parquet requires pyarrow. "
+            "Install it or convert GSM8K parquet to jsonl first."
+        ) from e
+
     table = pq.read_table(path)
     return table.to_pylist()
 
+
 def _find_gsm8k_file(path: Path, split: str) -> Path:
-    """
-    GSM8K 的数据文件命名和组织方式比较混乱，这个函数尝试按照一定的优先级顺序找到正确的文件：
-    1. 如果用户直接传了一个文件路径（而不是目录），就直接用这个文件。
-    2. 如果用户传了一个目录，我们先在这个目录下找一个叫 "main" 的子目录，如果有的话，就在这个子目录里找符合 "{split}-*.parquet" 或 "{split}.jsonl" 命名模式的文件。
-    3. 如果在 "main" 子目录里没有找到，我们就在用户传的目录下直接找符合 "{
+    """Resolve a GSM8K file path.
+
+    Supported inputs:
+    1. data/gsm8k/main/test-00000-of-00001.parquet
+    2. data/gsm8k/main
+    3. data/gsm8k
+
+    If data/gsm8k is given, prefer data/gsm8k/main/{split}-*.parquet.
     """
     if path.is_file():
         return path
@@ -63,17 +82,14 @@ def _find_gsm8k_file(path: Path, split: str) -> Path:
 
     candidates: list[Path] = []
 
-    # User may pass data/gsm8k, and the useful subset is data/gsm8k/main.
     main_dir = path / "main"
     if main_dir.is_dir():
         candidates.extend(sorted(main_dir.glob(f"{split}-*.parquet")))
         candidates.extend(sorted(main_dir.glob(f"{split}.jsonl")))
 
-    # User may pass data/gsm8k/main.
     candidates.extend(sorted(path.glob(f"{split}-*.parquet")))
     candidates.extend(sorted(path.glob(f"{split}.jsonl")))
 
-    # Last resort: any parquet/jsonl in that directory.
     candidates.extend(sorted(path.glob("*.parquet")))
     candidates.extend(sorted(path.glob("*.jsonl")))
 
@@ -84,152 +100,160 @@ def _find_gsm8k_file(path: Path, split: str) -> Path:
 
     return candidates[0]
 
-def load_gsm8k_examples(path: Path, *, split: str="test") -> list[dict[str, Any]]:
-    gsm8k_file = _find_gsm8k_file(Path(path), split=split)
-    print(f"Loading GSM8K {split} examples from: {gsm8k_file}")
-    
-    if gsm8k_file.suffix == ".parquet":
-        return _read_parquet(gsm8k_file)
-    elif gsm8k_file.suffix == ".jsonl":
-        return load_jsonl(gsm8k_file)
-    else:
-        raise ValueError(f"Unsupported GSM8K file format: {gsm8k_file}")
 
-
-
-@torch.inference_mode()# 这个装饰器可以让整个函数在推理模式下运行，禁用梯度计算和一些其他的训练相关功能，从而节省内存和提高性能。
-def generate_one(
-    model: torch.nn.Module,
-    tokenizer: Any,
-    prompt: str,
+def load_gsm8k_examples(
+    data_path: str | Path,
     *,
-    device: torch.device | str,
-    max_new_tokens: int = 512,
-) -> str:
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        add_special_tokens=False,  # GSM8K 的 prompt 已经是纯文本了，不需要 tokenizer 自动添加特殊 tokens 了。
-    )
+    split: str = "test",
+) -> list[dict[str, str | None]]:
+    """Load GSM8K examples from parquet or jsonl."""
+    path = _find_gsm8k_file(Path(data_path), split=split)
 
-    encoded = {
-        key: value.to(device) for key, value in encoded.items()
-    }
+    if path.suffix == ".parquet":
+        raw_rows = _read_parquet(path)
+    elif path.suffix == ".jsonl":
+        raw_rows = load_jsonl(path)
+    else:
+        raise ValueError(f"Unsupported GSM8K file format: {path}")
 
-    input_length = encoded["input_ids"].shape[1]
+    examples: list[dict[str, str | None]] = []
 
-    eos_token_id = tokenizer.eos_token_id
-    pad_token_id = tokenizer.pad_token_id
+    for row in raw_rows:
+        question = row.get("question")
+        answer = row.get("answer")
 
-    if pad_token_id is None:
-        pad_token_id = eos_token_id
-    
-    output_ids = model.generate(
-        **encoded,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,  # greedy decoding
-        temperature=None,  # greedy decoding
-        top_p=None,  # greedy decoding
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    )[0]
+        if not isinstance(question, str) or not isinstance(answer, str):
+            continue
 
-    new_token_ids = output_ids[input_length:]
-    output_text = tokenizer.decode(new_token_ids, skip_special_tokens=True)
-    return output_text
+        gold = parse_gsm8k_gold_answer(answer)
+
+        examples.append(
+            {
+                "question": question,
+                "answer": answer,
+                "gold": gold,
+            }
+        )
+
+    return examples
 
 
 def run_gsm8k_eval(
-    model: torch.nn.Module,
-    tokenizer: Any,
-    gsm8k_path: str | Path,
+    generator: TextGenerator,
+    gsm8k_data_path: str | Path,
     *,
     split: str = "test",
-    device: torch.device | str,
+    limit: int | None = None,
     max_new_tokens: int = 512,
     output_path: str | Path | None = None,
-    limit: int | None = None, # 这个参数可以让我们在调试阶段只 eval 前 N 个样本，避免每次都跑完整个测试集。
+    stop_strings: list[str] | None = None,
 ) -> dict[str, Any]:
-    model.eval()
-    if device is None:
-        device = next(model.parameters()).device
+    """Evaluate a model/backend on GSM8K.
 
-    examples = load_gsm8k_examples(gsm8k_path, split=split)
+    Args:
+        generator:
+            HFGenerator or VLLMGenerator.
+        gsm8k_data_path:
+            Path to GSM8K parquet/jsonl file or directory.
+        split:
+            Usually "test".
+        limit:
+            If set, only evaluate the first N examples.
+        max_new_tokens:
+            Generation budget.
+        output_path:
+            If set, write per-example predictions as JSONL.
+        stop_strings:
+            Optional generation stop strings.
+
+    Returns:
+        Summary dict.
+    """
+    examples = load_gsm8k_examples(gsm8k_data_path, split=split)
 
     if limit is not None and limit > 0:
         examples = examples[:limit]
 
     if not examples:
-        raise ValueError("No GSM8K examples found.")
+        raise RuntimeError(f"No GSM8K examples found at {gsm8k_data_path}")
 
     if output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # 清空
         output_path.write_text("", encoding="utf-8")
+
+    prompts = [
+        make_gsm8k_prompt(str(example["question"]))
+        for example in examples
+    ]
+
+    start_time = time.perf_counter()
+
+    model_outputs = generator.generate(
+        prompts,
+        max_new_tokens=max_new_tokens,
+        stop_strings=stop_strings,
+    )
+
+    elapsed_seconds = time.perf_counter() - start_time
+
+    if len(model_outputs) != len(examples):
+        raise RuntimeError(
+            f"Generator returned {len(model_outputs)} outputs for "
+            f"{len(examples)} prompts."
+        )
 
     total = 0
     correct = 0
     parsed = 0
     gold_parsed = 0
 
-    progress = tqdm(examples, desc="Evaluating GSM8K", unit="ex")
-
-    for idx, example in enumerate(progress):
-        question = example["question"]
-        gold = example["answer"]
-
-        prompt = make_gsm8k_prompt(question)
-        model_output = generate_one(
-            model,
-            tokenizer,
-            prompt,
-            device=device,
-            max_new_tokens=max_new_tokens,
+    for idx, (example, prompt, model_output) in enumerate(
+        tqdm(
+            zip(examples, prompts, model_outputs, strict=True),
+            total=len(examples),
+            desc="GSM8K parse/score",
         )
-
+    ):
+        gold = example["gold"]
         pred = parse_gsm8k_response(model_output)
-        gold_answer = parse_gsm8k_gold_answer(gold)
-
-        is_correct = numbers_equal(pred, gold_answer)
+        is_correct = numbers_equal(pred, gold)
 
         total += 1
-        if is_correct:
-            correct += 1
-        if pred is not None:
-            parsed += 1
-        if gold_answer is not None:
-            gold_parsed += 1
-
-        progress.set_postfix({
-            "acc": f"{correct}/{total}={correct/total:.4f}",
-            "parsed": f"{parsed}/{total}={parsed/total:.4f}",
-            "gold_parsed": f"{gold_parsed}/{total}={gold_parsed/total:.4f}",
-        })
+        correct += int(is_correct)
+        parsed += int(pred is not None)
+        gold_parsed += int(gold is not None)
 
         if output_path is not None:
-            append_jsonl(output_path, {
-                "question": question,
-                "gold": gold,
-                "model_output": model_output,
-                "pred": pred,
-                "gold_parsed": gold_parsed,
-                "is_correct": is_correct,
-            })
+            append_jsonl(
+                output_path,
+                {
+                    "idx": idx,
+                    "question": example["question"],
+                    "gold_answer_raw": example["answer"],
+                    "gold": gold,
+                    "prompt": prompt,
+                    "model_output": model_output,
+                    "pred": pred,
+                    "correct": is_correct,
+                },
+            )
 
-        accuracy = correct / total if total > 0 else 0.0
-        parsed_ratio = parsed / total if total > 0 else 0.0
-        gold_parsed_ratio = gold_parsed / total if total > 0 else 0
+    accuracy = correct / total if total > 0 else 0.0
+    parse_rate = parsed / total if total > 0 else 0.0
+    gold_parse_rate = gold_parsed / total if total > 0 else 0.0
+    examples_per_second = total / elapsed_seconds if elapsed_seconds > 0 else 0.0
 
     return {
         "benchmark": "gsm8k",
         "split": split,
-        "data_path": str(gsm8k_path),
+        "data_path": str(gsm8k_data_path),
         "num_examples": total,
         "correct": correct,
         "accuracy": accuracy,
-        "parsed": parsed,
-        "parsed_ratio": parsed_ratio,
-        "gold_parsed": gold_parsed,
+        "parse_rate": parse_rate,
+        "gold_parse_rate": gold_parse_rate,
         "max_new_tokens": max_new_tokens,
+        "elapsed_seconds": elapsed_seconds,
+        "examples_per_second": examples_per_second,
     }
