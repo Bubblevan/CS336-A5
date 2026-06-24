@@ -44,6 +44,7 @@ from cs336_alignment.eval.generation import (
     VLLMGenerationConfig as VLLMGenerator,
 )
 from cs336_alignment.eval.gsm8k import run_gsm8k_eval
+from cs336_alignment.eval.math import run_math_eval
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,13 +67,19 @@ def parse_args() -> argparse.Namespace:
         "--benchmarks",
         type=str,
         default="gsm8k",
-        help="Comma-separated benchmark names. V1 supports: gsm8k.",
+        help="Comma-separated benchmark names. Supported: gsm8k, math.",
     )
     parser.add_argument(
         "--gsm8k_path",
         type=str,
         default="data/gsm8k/main/test-00000-of-00001.parquet",
         help="Path to GSM8K parquet/jsonl file or directory.",
+    )
+    parser.add_argument(
+        "--math_path",
+        type=str,
+        default="/root/gpufree-share/data/MATH/validation.jsonl",
+        help="Path to MATH JSONL file (validation.jsonl).",
     )
     parser.add_argument(
         "--output_dir",
@@ -134,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hf_batch_size",
         type=int,
-        default=8,
+        default=64,
         help="Batch size for HF generate fallback.",
     )
     parser.add_argument(
@@ -156,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
-        default=0.90,
+        default=0.95,
     )
     parser.add_argument(
         "--max_model_len",
@@ -170,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vllm_chunk_size",
         type=int,
-        default=512,
+        default=1024,
         help="Number of prompts sent to vLLM per chunk.",
     )
     parser.add_argument(
@@ -257,11 +264,11 @@ def main() -> None:
         if name.strip()
     }
 
-    unsupported = benchmark_names - {"gsm8k"}
+    unsupported = benchmark_names - {"gsm8k", "math"}
     if unsupported:
         raise ValueError(
-            f"Unsupported benchmarks in V1: {sorted(unsupported)}. "
-            "Currently only 'gsm8k' is implemented."
+            f"Unsupported benchmarks: {sorted(unsupported)}. "
+            "Supported: gsm8k, math."
         )
 
     print(f"Building inference backend: {args.engine}")
@@ -298,6 +305,31 @@ def main() -> None:
         print("\nGSM8K summary:")
         for key, value in gsm8k_summary.items():
             print(f"  {key}: {value}")
+
+    if "math" in benchmark_names:
+        predictions_path = output_dir / "math_predictions.jsonl"
+
+        print(f"Running MATH eval on: {args.math_path}")
+        math_summary = run_math_eval(
+            generator=generator,
+            math_data_path=args.math_path,
+            split="validation",
+            limit=args.limit,
+            max_new_tokens=args.max_new_tokens,
+            output_path=predictions_path,
+            stop_strings=args.stop_strings,
+        )
+
+        summaries["math"] = math_summary
+
+        print("\nMATH summary:")
+        for key, value in math_summary.items():
+            if key in ("by_subject", "by_level"):
+                print(f"  {key}:")
+                for sub_key, sub_val in value.items():
+                    print(f"    {sub_key}: {sub_val}")
+            else:
+                print(f"  {key}: {value}")
 
     summary_path = output_dir / "summary.json"
     write_json(summary_path, summaries)

@@ -103,7 +103,9 @@ source .venv/bin/activate
 
 ## 数据准备
 
-本作业使用 5 个数据集。下载方式见各小节，本地数据已就绪，存放在 `data/` 下。
+这个 MATH-12K 不开源确实难搞，不能体会到原汁原味的课程内容，不过好像也有[社区总结](https://huggingface.co/datasets/garg-aayush/sft-cs336-assign5-datasets/tree/main)。
+
+下载方式见各小节，本地数据已就绪，存放在 `data/` 下。
 
 ### 模型权重
 
@@ -143,6 +145,44 @@ A: Natalia sold 48/2 = <<48/2=24>>24 clips in May.
   --local-dir data/gsm8k
 ```
 
+**SFT 格式转换**（`scripts/prepare_sft_data.py`）：
+
+将原始 parquet 转为 JSON/JSONL，每行包含：
+- `question`: 数学题原文
+- `answer`: GSM8K 原始答案（CoT + `#### 42`）
+- `prompt`: r1_zero 模板格式化后的 prompt（`<think>` 前缀）
+- `response`: `<think> 推理过程 </think> <answer> 答案 </answer>` 格式
+
+```bash
+uv run python scripts/prepare_sft_data.py
+```
+
+输出：
+| 文件 | 记录数 | 用途 |
+|------|--------|------|
+| `data/gsm8k/train.json` / `.jsonl` | 7,473 | SFT 训练 |
+| `data/gsm8k/test.json` / `.jsonl` | 1,319 | SFT 验证 / 评估 |
+
+### TULU-3 SFT Personas Math
+
+- **来源**: [allenai/tulu-3-sft-personas-math](https://huggingface.co/datasets/allenai/tulu-3-sft-personas-math) — Allen AI 发布的合成数学指令数据集，通过 persona 增强生成 149,960 条复杂数学应用题。
+- **许可**: ODC-BY（研究 / 教育用途）
+- **格式**: Parquet（`train-00000-of-00002.parquet` + `train-00001-of-00002.parquet`）
+- **数量**: 149,960（仅 train，无标准 test split）
+- **数据字段**: `id`（唯一标识） / `prompt`（数学题） / `messages`（`[{"role":"user","content":...}, {"role":"assistant","content":...}]`）
+- **生成模型**: GPT-4o、Claude 3.5 Sonnet
+- **用途**: SFT 阶段增强模型的复杂数学推理能力。与 GSM8K 相比，题目更复杂、场景更多样化（融合了各类 persona 背景）。
+
+**SFT 格式转换**（`scripts/prepare_sft_data.py`）：
+
+```bash
+uv run python scripts/prepare_sft_data.py
+```
+
+将 `messages` 字段拆为 `prompt`（user）+ `response`（assistant），输出：
+| 文件 | 记录数 | 用途 |
+|------|--------|------|
+| `data/tulu-3-sft-personas-math/train.json` / `.jsonl` | 149,960 | SFT 训练 |
 ### MMLU
 
 - **来源**: [cais/mmlu](https://huggingface.co/datasets/cais/mmlu) — Massive Multitask Language Understanding，57 个学科的多选题基准。
@@ -273,7 +313,7 @@ uv run python -m cs336_alignment.run_benchmarks \
 
 参数说明：
 - `--model_id` — 模型路径或 HuggingFace ID
-- `--benchmarks` — 评估基准（当前仅支持 `gsm8k`）
+- `--benchmarks` — 评估基准。支持 `gsm8k`、`math`，或用逗号组合 `gsm8k,math`
 - `--gsm8k_path` — 数据文件或目录。接受 `data/gsm8k`、`data/gsm8k/main` 或具体的 parquet/jsonl 文件
 - `--output_dir` — 输出目录（生成 `summary.json` 和 `gsm8k_predictions.jsonl`）
 - `--limit N` — 仅跑前 N 条做快速验证
@@ -289,6 +329,63 @@ GSM8K summary:
   accuracy: 0.2820
   parsed: 1310
   parsed_ratio: 0.9932
+```
+
+### MATH（数学推理 — LaTeX 答案）
+
+MATH 评估在 GSM8K 的基础上多了一个关键差异：**答案判分方式**。GSM8K 的答案永远是最后一个数字（`#### 42`），但 MATH 的答案用 LaTeX 表示（`\dfrac{1}{9}`、`\boxed{420}`），需要符号级等价性判断。
+
+评估使用 `reasoning/rewards.py` 中的 `grade()` 函数，它先用字符串归一化做快速比较，再 fallback 到 `sympy` 化简做数学等价性判断，可处理 `\frac{1}{9}` ≡ `1/9`、`\dfrac{1}{9}` ≡ `\frac{1}{9}` 等场景。
+
+```bash
+# vLLM 后端（推荐）
+CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  uv run python -m cs336_alignment.run_benchmarks \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B \
+    --engine vllm \
+    --benchmarks math \
+    --math_path /root/gpufree-share/data/MATH/validation.jsonl \
+    --output_dir outputs/baseline_math \
+    --max_new_tokens 1024 \
+    --gpu_memory_utilization 0.90 \
+    --max_model_len 4096
+
+# HF 后端（无 vLLM 时 fallback）
+uv run python -m cs336_alignment.run_benchmarks \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B \
+    --engine hf \
+    --benchmarks math \
+    --math_path /root/gpufree-share/data/MATH/validation.jsonl \
+    --output_dir outputs/baseline_math_hf \
+    --device cuda:0 \
+    --hf_batch_size 8 \
+    --max_new_tokens 1024
+```
+
+参数说明：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--math_path` | `/root/gpufree-share/data/MATH/validation.jsonl` | MATH JSONL 文件路径 |
+| `--benchmarks` | `gsm8k` | 改为 `math` 或 `gsm8k,math` 同时跑两个 |
+
+输出包含 per-subject 和 per-level 分桶准确率：
+
+```
+MATH summary:
+  benchmark: math
+  num_examples: 5000
+  correct: 1850
+  accuracy: 0.37
+  format_rate: 1.0
+  by_subject:
+    Algebra: {'total': 1187, 'correct': 487, 'accuracy': 0.41}
+    Counting & Probability: {'total': 474, 'correct': 142, 'accuracy': 0.30}
+    Geometry: {'total': 479, 'correct': 148, 'accuracy': 0.31}
+    Intermediate Algebra: {'total': 561, 'correct': 196, 'accuracy': 0.35}
+    Number Theory: {'total': 426, 'correct': 162, 'accuracy': 0.38}
+    Prealgebra: {'total': 1112, 'correct': 490, 'accuracy': 0.44}
+    Precalculus: {'total': 761, 'correct': 225, 'accuracy': 0.30}
 ```
 
 ## 提交
