@@ -109,13 +109,20 @@ def main() -> None:
     # 固定全局随机种子（Python随机、numpy、torch），保证实验可复现
     set_seed(args.seed)
 
-    # 创建输出目录，父目录不存在则自动创建
+    # 输出目录：weights 放共享存储（gpufree-share），轻量日志放项目目录
+    run_name = args.wandb_run_name or f"sft-{Path(args.model_id).name}-bs{args.batch_size}x{args.grad_accum_steps}-lr{args.lr}"
+    weights_dir = Path("/root/gpufree-share/data/sft/checkpoints") / run_name
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # 从 output_dir 创建软链接指向 weights_dir
+    link_path = output_dir / "checkpoints"
+    if not link_path.exists():
+        rel = Path("../../../gpufree-share/data/sft/checkpoints") / run_name
+        link_path.symlink_to(rel)
 
     # ── 初始化 Weights & Biases 实验追踪 ──
-    # 自动生成运行名：模型名 + 批次配置 + 学习率，便于快速区分实验
-    run_name = args.wandb_run_name or f"sft-{Path(args.model_id).name}-bs{args.batch_size}x{args.grad_accum_steps}-lr{args.lr}"
     wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -237,7 +244,7 @@ def main() -> None:
 
     # 早停与最佳检查点追踪
     best_eval_accuracy = 0.0
-    best_ckpt_path = output_dir / "best.pt"
+    best_ckpt_path = weights_dir / "best.pt"
     early_stop_counter = 0
     early_stopped = False
 
@@ -326,30 +333,34 @@ def main() -> None:
 
                 # 早停判断：冷却步数后才开始检查
                 current_acc = eval_metrics.get("eval/accuracy", 0.0)
+
+                # 最佳检查点始终保存（不受 cooldown 影响）
+                if current_acc > best_eval_accuracy:
+                    best_eval_accuracy = current_acc
+                    torch.save({
+                        "step": global_step,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "eval_accuracy": current_acc,
+                    }, best_ckpt_path)
+                    print(f"  ★ New best accuracy: {current_acc:.4f} → {best_ckpt_path}")
+
+                # 早停计数和触发（受 cooldown 保护）
                 if global_step >= args.cooldown_steps:
-                    if current_acc > best_eval_accuracy:
-                        best_eval_accuracy = current_acc
-                        early_stop_counter = 0
-                        # 保存最佳检查点
-                        torch.save({
-                            "step": global_step,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "eval_accuracy": current_acc,
-                        }, best_ckpt_path)
-                        print(f"  ★ New best accuracy: {current_acc:.4f} → {best_ckpt_path}")
-                    else:
+                    if current_acc <= best_eval_accuracy:
                         early_stop_counter += 1
                         print(f"  Early stop counter: {early_stop_counter}/{args.patience} (best: {best_eval_accuracy:.4f})")
                         if early_stop_counter >= args.patience:
                             print(f"\n  Early stopping triggered at step {global_step} (best accuracy: {best_eval_accuracy:.4f})")
                             early_stopped = True
                             break
+                    else:
+                        early_stop_counter = 0
 
             # 步骤F：定期保存检查点（含早停跳出检测）
             if global_step % args.save_every == 0 and global_step > 0:
-                ckpt_path = output_dir / f"checkpoint_{global_step}.pt"
+                ckpt_path = weights_dir / f"checkpoint_{global_step}.pt"
                 # 保存完整训练状态，支持断点续训
                 torch.save({
                     "step": global_step,
@@ -363,7 +374,7 @@ def main() -> None:
             global_step += 1
 
     # ── 7. 训练结束，保存最终模型与日志 ──
-    final_path = output_dir / "final.pt"
+    final_path = weights_dir / "final.pt"
     torch.save({
         "step": global_step,
         "model_state_dict": model.state_dict(),
@@ -399,32 +410,24 @@ def _run_eval(
     核心注意点（高频易错）：
         1. 评估必须切换模型为eval模式，关闭dropout等训练层
         2. 生成任务必须使用左填充（left padding），右填充会导致生成位置错位
-        3. 推理模式下禁用梯度计算，节省显存并加速
-        4. 评估完成后必须恢复模型为train模式与分词器原始设置
+        3. 推理模式下禁用梯度计算，节省显存与耗时
     """
-    # 切换为评估模式
     model.eval()
 
-    # 保存分词器原始填充方向，评估时临时改为左填充
-    # 为什么生成必须左填充？
-    # → 因果LM从左到右生成，有效内容靠右侧结尾对齐；左填充能保证所有样本的生成起始位置正确
-    #   若用右填充，填充token会占据序列末尾，干扰生成逻辑
+    # Save original padding side and set to 'left' for generation
     orig_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
 
-    correct = 0      # 正确样本数
-    total = 0        # 总样本数
-    formatted = 0    # 格式合规样本数
-    results = []     # 详细结果记录
+    correct = 0
+    total = 0
+    formatted = 0
+    results = []
 
-    # 推理模式：禁用梯度计算，大幅降低显存占用
     with torch.inference_mode():
-        # 按批次遍历验证集，批次大小为8
         for i in range(0, len(val_prompts), 8):
             batch_prompts = val_prompts[i : i + 8]
             batch_golds = val_golds[i : i + 8]
 
-            # 批量分词与填充
             encoded = tokenizer(
                 batch_prompts,
                 return_tensors="pt",
@@ -432,29 +435,22 @@ def _run_eval(
                 add_special_tokens=False,
             ).to(device)
 
-            # 记录输入长度，用于后续只截取新生成的token
             input_length = encoded["input_ids"].shape[1]
-            # 执行生成
             generated_ids = model.generate(
                 **encoded,
-                max_new_tokens=512,       # 最大新生成长度，限制输出长度
-                do_sample=False,          # 贪心解码，评估时关闭采样保证结果可复现
+                max_new_tokens=512,
+                do_sample=False,
                 temperature=None,
-                use_cache=True,           # 开启KV缓存，加速自回归生成
+                use_cache=True,
                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             )
-            # 只截取输入之后新生成的token部分，去掉prompt
             new_token_ids = generated_ids[:, input_length:]
-            # 批量解码为文本
             batch_outputs = tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)
 
-            # 逐样本判分
             for prompt, gold, output in zip(batch_prompts, batch_golds, batch_outputs):
-                # 从生成文本中提取最终答案（匹配\boxed{}格式）
                 pred = extract_math_answer(output)
                 if pred is not None:
                     formatted += 1
-                    # 调用判分函数，对比预测答案与标准答案
                     from cs336_alignment.reasoning.rewards import grade
                     is_correct = grade(pred, gold, fast=True)
                 else:
@@ -463,19 +459,18 @@ def _run_eval(
                 correct += int(is_correct)
                 total += 1
                 results.append({
-                    "prompt": prompt[:100],  # 只保留prompt前100字符，节省存储空间
+                    "prompt": prompt[:100],
                     "gold": gold,
                     "pred": pred,
                     "correct": is_correct,
                 })
 
-    # 计算聚合指标
     accuracy = correct / total if total > 0 else 0.0
     format_rate = formatted / total if total > 0 else 0.0
 
     metrics = {
-        "eval/accuracy": accuracy,       # 最终准确率
-        "eval/format_rate": format_rate, # 格式合规率
+        "eval/accuracy": accuracy,
+        "eval/format_rate": format_rate,
         "eval/correct": correct,
         "eval/total": total,
     }
@@ -483,13 +478,11 @@ def _run_eval(
     print(f"\n  Eval step {step}: accuracy={accuracy:.4f} ({correct}/{total}), "
           f"format_rate={format_rate:.3f}")
 
-    # 保存评估结果到本地，保留前20条详细结果用于抽样分析
     write_json(output_dir / f"eval_{step}.json", {"step": step, **metrics, "results": results[:20]})
 
-    # 恢复分词器原始填充方向
+    # Restore original padding side
     tokenizer.padding_side = orig_padding_side
 
-    # 切回训练模式，继续后续训练
     model.train()
     return metrics
 
