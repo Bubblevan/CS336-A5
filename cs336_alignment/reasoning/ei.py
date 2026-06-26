@@ -30,7 +30,7 @@ import wandb
 
 # 复用SFT核心模块
 from cs336_alignment.core.batching import get_packed_sft_dataset, iterate_batches, split_microbatches
-from cs336_alignment.core.scoring import compute_log_probs_from_logits
+from cs336_alignment.core.scoring import compute_log_probs_from_logits, get_response_log_probs
 from cs336_alignment.core.utils import set_seed, write_json
 # 复用数学评估工具
 from cs336_alignment.eval.math import load_math_examples, make_math_prompt, extract_math_answer
@@ -104,6 +104,7 @@ def expert_iteration_round(
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     vllm_generator: Any = None,
+    wandb_step: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     执行单轮专家迭代：生成推理轨迹 → 筛选正确样本 → 监督微调更新模型。
@@ -165,6 +166,7 @@ def expert_iteration_round(
         all_responses = vllm_generator.generate(
             all_prompts,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
         )
     else:
         # ── HF generate 生成（fallback） ──
@@ -269,14 +271,18 @@ def expert_iteration_round(
             # 拆分为微批次，用于梯度累积
             microbatches = split_microbatches(batch, grad_accum_steps=4)
             accum_loss = 0.0
+            entropy_accum = 0.0
+            token_count = 0
 
             for micro_batch in microbatches:
                 input_ids = micro_batch["input_ids"].to(device)
                 labels = micro_batch["labels"].to(device)
-                # 前向得到logits
-                logits = model(input_ids).logits
-                # 提取真实标签的对数概率
-                log_probs = compute_log_probs_from_logits(logits, labels)
+                # 前向 + 提取对数概率 + 熵（get_response_log_probs 一步完成）
+                result = get_response_log_probs(
+                    model, input_ids, labels, return_token_entropy=True,
+                )
+                log_probs = result["log_probs"]
+                token_entropy = result["token_entropy"]
                 # Packed数据集全序列有效，掩码全1
                 response_mask = torch.ones_like(log_probs)
 
@@ -290,6 +296,11 @@ def expert_iteration_round(
                 loss.backward()
                 accum_loss += meta["loss"].item()
 
+                # 累加熵（用于 wandb 日志）
+                if wandb_step is not None:
+                    entropy_accum += (token_entropy * response_mask).sum().item()
+                    token_count += response_mask.sum().item()
+
             # 梯度裁剪，防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # 优化器更新参数
@@ -301,6 +312,15 @@ def expert_iteration_round(
             n_batches += 1
             pbar.update(1)
             pbar.set_postfix({"loss": f"{accum_loss:.3f}"})
+
+            # wandb 日志：每步 optimizer step 记录一次
+            if wandb_step is not None:
+                avg_entropy = entropy_accum / max(token_count, 1)
+                wandb.log({
+                    "train/sft_loss": accum_loss,
+                    "train/avg_entropy": avg_entropy,
+                }, step=wandb_step[0])
+                wandb_step[0] += 1
         pbar.close()
 
         # 打印本轮平均损失
@@ -422,6 +442,7 @@ def expert_iteration_loop(args: Any) -> None:
     # ── 多轮EI主循环 ──
     round_results = []
     start_time = time.perf_counter()
+    wandb_step = [0]  # 可变的 step 计数器，传入 round 函数内部递增
 
     for round_idx in range(1, args.ei_rounds + 1):
         print(f"\n{'='*60}")
@@ -443,6 +464,7 @@ def expert_iteration_loop(args: Any) -> None:
             max_new_tokens=args.ei_max_new_tokens,
             temperature=args.ei_temperature,
             vllm_generator=vllm_generator,
+            wandb_step=wandb_step,
         )
 
         # SFT 后模型权重变了，需要更新 vLLM
@@ -484,16 +506,19 @@ def expert_iteration_loop(args: Any) -> None:
         print(f"  Eval: accuracy={eval_metrics['accuracy']:.4f} "
               f"({eval_metrics['correct']}/{eval_metrics['total']})")
 
-        # 写入W&B日志
+        # 写入W&B日志（使用 wandb_step 延续，确保 wandb 能看到连续曲线）
         wandb.log({
+            "eval/rollout_accuracy": rollout_accuracy,
+            "eval/num_correct": len(sft_data),
+            "eval/accuracy": eval_metrics["accuracy"],
+            "eval/format_rate": eval_metrics["format_rate"],
+            "eval/elapsed_seconds": round(time.perf_counter() - round_start, 1),
             f"round_{round_idx}/rollout_accuracy": rollout_accuracy,
             f"round_{round_idx}/num_correct": len(sft_data),
             f"round_{round_idx}/eval_accuracy": eval_metrics["accuracy"],
             f"round_{round_idx}/eval_format_rate": eval_metrics["format_rate"],
-            f"round_{round_idx}/elapsed_seconds": round(time.perf_counter() - round_start, 1),
-            "rollout_accuracy": rollout_accuracy,
-            "eval_accuracy": eval_metrics["accuracy"],
-        }, step=round_idx)
+        }, step=wandb_step[0])
+        wandb_step[0] += 1
 
         # 记录本轮结果
         round_elapsed = time.perf_counter() - round_start

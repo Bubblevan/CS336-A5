@@ -199,7 +199,7 @@ def generate_completions(
             "temperature": sampling_params["temperature"],
             "max_tokens": sampling_params["max_tokens"],
             "n": sampling_params["n"],
-            "seed": sampling_params["seed"],
+            "seed": sampling_params.get("seed"),
             "return_token_ids": True,
         }
         if sampling_params.get("stop") is not None:
@@ -272,6 +272,10 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
 
     torch.cuda.set_device(next(policy.parameters()).device)
     _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
+    # vLLM v1 requires start_weight_update before update_weights
+    # It expects the same update_info payload
+    _http_json("POST", f"{vllm_base_url}/start_weight_update",
+               {"update_info": update_info}, timeout=60)
     with ThreadPoolExecutor(max_workers=1) as executor:
         update_future = executor.submit(
             _http_json,
@@ -288,5 +292,6 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
             ),
         )
         update_future.result()
+    _http_json("POST", f"{vllm_base_url}/finish_weight_update", timeout=60)
     _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
     _http_json("POST", f"{vllm_base_url}/resume", timeout=60)

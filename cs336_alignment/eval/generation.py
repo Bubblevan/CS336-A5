@@ -185,13 +185,14 @@ class VLLMGenerationConfig:
         prompts: list[str],
         *,
         max_new_tokens: int,
+        temperature: float = 0.0,
         stop_strings: list[str] | None = None,
     ) -> list[str]:
         from vllm import SamplingParams
 
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
-            temperature=0.0,
+            temperature=temperature,
             top_p=1.0,
             stop=stop_strings,
         )

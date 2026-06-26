@@ -248,28 +248,6 @@ uv run python scripts/prepare_sft_data.py
   --local-dir data/simple_safety_tests
 ```
 
-## 训练流程
-
-### SFT
-```bash
-uv run python -m cs336_alignment.run_sft \
-    --model_id Qwen/Qwen2.5-Math-1.5B \
-    --device cuda:0 \
-    --vllm_device cuda:1 \
-    --max_steps 200 \
-    --batch_size 8
-```
-
-### GRPO / Expert Iteration
-```bash
-uv run python -m cs336_alignment.run_grpo \
-    --model_id Qwen/Qwen2.5-Math-1.5B \
-    --device cuda:0 \
-    --vllm_device cuda:1 \
-    --group_size 8 \
-    --max_steps 100
-```
-
 ## 基准评估
 
 ### GSM8K（数学推理）
@@ -378,15 +356,99 @@ MATH summary:
   correct: 1850
   accuracy: 0.37
   format_rate: 1.0
-  by_subject:
-    Algebra: {'total': 1187, 'correct': 487, 'accuracy': 0.41}
-    Counting & Probability: {'total': 474, 'correct': 142, 'accuracy': 0.30}
-    Geometry: {'total': 479, 'correct': 148, 'accuracy': 0.31}
-    Intermediate Algebra: {'total': 561, 'correct': 196, 'accuracy': 0.35}
-    Number Theory: {'total': 426, 'correct': 162, 'accuracy': 0.38}
-    Prealgebra: {'total': 1112, 'correct': 490, 'accuracy': 0.44}
-    Precalculus: {'total': 761, 'correct': 225, 'accuracy': 0.30}
 ```
+
+### GRPO 训练
+
+GRPO 训练接受 `--train_data`（问题集，每行 `{"problem": ..., "answer": ...}` 或 `{"question": ..., "answer": ...}`）和 `--val_data`（验证集）。
+
+**必备参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model_id` | 必填 | 模型路径或 HF ID。从 EI 或 SFT checkpoint 启动 |
+| `--train_data` | 必填 | 训练集 JSONL 路径（支持 MATH 格式 `problem` 或 GSM8K 格式 `question`）|
+| `--val_data` | 必填 | 验证集 JSONL 路径 |
+| `--prompt_path` | 必填 | Prompt 模板文件路径（如 `cs336_alignment/prompts/r1_zero.prompt`）|
+
+**双卡模式（cuda:0 训练 + cuda:1 vLLM 生成）**：
+
+```bash
+uv run python -m cs336_alignment.run_grpo \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B-EI-round3 \
+    --train_data /root/gpufree-share/data/MATH/train.jsonl \
+    --val_data /root/gpufree-share/data/MATH/validation.jsonl \
+    --prompt_path cs336_alignment/prompts/r1_zero.prompt \
+    --device cuda:0 --engine vllm --vllm_device cuda:1 --vllm_gpu_util 0.85 \
+    --group_size 8 --rollout_batch_size 256 \
+    --train_batch_size 32 --grad_accum_steps 8 \
+    --lr 3e-5 --n_grpo_steps 100 \
+    --loss_type grpo_clip --length_norm_type mask_normalize \
+    --kl_coef 0.04 \
+    --early_stopping_patience 3 \
+    --eval_every_steps 5 --save_every_steps 25 \
+    --eval_limit 200 \
+    --wandb_project cs336-grpo \
+    --output_dir outputs/grpo_v1
+```
+
+**单卡模式（HF generate 替代 vLLM）**：
+
+```bash
+uv run python -m cs336_alignment.run_grpo \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B-EI-round3 \
+    --train_data /root/gpufree-share/data/MATH/train.jsonl \
+    --val_data /root/gpufree-share/data/MATH/validation.jsonl \
+    --prompt_path cs336_alignment/prompts/r1_zero.prompt \
+    --device cuda:0 --engine hf \
+    --group_size 8 --rollout_batch_size 32 \
+    --train_batch_size 8 --grad_accum_steps 4 \
+    --lr 1e-5 --n_grpo_steps 100 \
+    --loss_type grpo_clip --length_norm_type mask_normalize \
+    --kl_coef 0.04 \
+    --early_stopping_patience 3 \
+    --eval_every_steps 5 --save_every_steps 25 \
+    --eval_limit 200 \
+    --wandb_project cs336-grpo \
+    --output_dir outputs/grpo_v1
+```
+
+**烟雾测试（快速验证流程）**：
+
+```bash
+uv run python -m cs336_alignment.run_grpo \
+    --model_id /root/gpufree-share/models/Qwen2.5-Math-1.5B-EI-round3 \
+    --train_data /root/gpufree-share/data/MATH/train.jsonl \
+    --val_data /root/gpufree-share/data/MATH/validation.jsonl \
+    --prompt_path cs336_alignment/prompts/r1_zero.prompt \
+    --device cuda:0 --engine hf \
+    --group_size 4 --rollout_batch_size 8 \
+    --train_batch_size 4 --grad_accum_steps 2 \
+    --n_grpo_steps 3 \
+    --lr 3e-5 --loss_type grpo_clip --length_norm_type mask_normalize \
+    --kl_coef 0.04 --early_stopping_patience 3 \
+    --train_limit 8 --eval_limit 10 \
+    --output_dir outputs/grpo_smoke
+```
+
+**参数说明**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--engine` | `vllm` | 生成引擎。`vllm` 需要双卡，`hf` 单卡可用 |
+| `--group_size` | 8 | 每问题生成 G 条回答 |
+| `--rollout_batch_size` | 128 | 每轮总回答数（需被 group_size 整除）|
+| `--train_batch_size` | 16 | 逻辑 batch 大小 |
+| `--grad_accum_steps` | 4 | 梯度累积步数。micro_batch_size = train_batch_size / grad_accum_steps |
+| `--lr` | 3e-5 | 学习率。1.5B 模型建议 1e-5~3e-5 |
+| `--loss_type` | `grpo_clip` | 策略梯度类型：`no_baseline` / `reinforce_with_baseline` / `grpo_clip` |
+| `--length_norm_type` | `mask_normalize` | 长度归一化方式。`mask_normalize`（Dr. GRPO）优于 `mask_mean` |
+| `--kl_coef` | 0.0 | KL 散度惩罚系数。0=禁用。建议 0.01~0.1 |
+| `--early_stopping_patience` | 3 | 连续 N 次 eval 不创新高时停止。0=禁用 |
+| `--n_grpo_steps` | 50 | 最大 GRPO 步数 |
+| `--eval_every_steps` | 10 | 每 N 步评估一次 |
+| `--save_every_steps` | 25 | 每 N 步保存一次 checkpoint |
+| `--wandb_project` | `cs336-grpo` | wandb 项目名 |
 
 ## 提交
 
